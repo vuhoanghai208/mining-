@@ -320,15 +320,47 @@ local function TeleZoneTop(n)
     end
     return false
 end
+local function WaitForInstanceContainer(timeout)
+    timeout = timeout or 25
+    local t0 = os.clock()
+    while os.clock() - t0 < timeout do
+        local ok, cont = pcall(function()
+            local things = workspace:FindFirstChild("__THINGS")
+            local ic = things and things:FindFirstChild("__INSTANCE_CONTAINER")
+            local act = ic and ic:FindFirstChild("Active")
+            return act and act:FindFirstChild("SpaceMiningEvent")
+        end)
+        if ok and cont then return cont end
+        task.wait(0.5)
+    end
+    return nil
+end
+
 local function EnsureInstance()
-    if InstancingCmds.IsInInstance() then return true end
+    if InstancingCmds.IsInInstance() then
+        local cont = WaitForInstanceContainer(8)
+        return cont ~= nil
+    end
     if not C["Auto Join"] then return false end
     S.status = "vào event"
-    log("Vào event Space Mining")
+    log("Đang vào event Space Mining...")
     pcall(InstancingCmds.Enter, "SpaceMiningEvent")
     local t0 = os.clock()
     repeat task.wait(0.5) until InstancingCmds.IsInInstance() or os.clock() - t0 > 25
-    return InstancingCmds.IsInInstance()
+    if not InstancingCmds.IsInInstance() then
+        log("Vào event thất bại: timeout InstancingCmds")
+        return false
+    end
+    local cont = WaitForInstanceContainer(20)
+    if not cont then
+        log("Vào event thất bại: container SpaceMiningEvent chưa load")
+        return false
+    end
+    local charT0 = os.clock()
+    repeat task.wait(0.25) until HRP() or os.clock() - charT0 > 10
+    task.wait(1.5) -- grace period ổn định bộ nhớ và stream dữ liệu trên mobile
+    log("Đã vào event Space Mining thành công & map đã sẵn sàng")
+    return true
 end
 local function GetLocal()
     local ok, loc = pcall(BWC.GetLocal)
@@ -363,6 +395,7 @@ local function ReSync(reason)
     pcall(InstancingCmds.Enter, "SpaceMiningEvent")
     t0 = os.clock()
     repeat task.wait(0.3) until InstancingCmds.IsInInstance() or os.clock() - t0 > 25
+    WaitForInstanceContainer(15)
     task.wait(3) -- chờ block stream về
     S.locAt = os.clock()
     S.emptySince = nil
@@ -1428,15 +1461,16 @@ local function DoBomb(loc)
 end
 S.DoBomb = DoBomb
 
--- Luồng spam bom dải thảm song song (background thread) y hệt file main
-task.spawn(function()
-    while Alive() and Latest() do
-        if C["Auto Bomb"] and S.loc and not S.loc.Destroyed and not S.loc.Respawning then
-            pcall(DoBomb, S.loc)
+local function StartBombThread()
+    task.spawn(function()
+        while Alive() and Latest() do
+            if C["Auto Bomb"] and S.loc and not S.loc.Destroyed and not S.loc.Respawning then
+                pcall(DoBomb, S.loc)
+            end
+            task.wait(0.15)
         end
-        task.wait(0.15)
-    end
-end)
+    end)
+end
 
 -- ------------------------------------------------------------
 -- merchant (copy từ main_mining2: Merchant_GetOffers luôn nil, cứ RequestPurchase từng slot, server tự validate)
@@ -1523,15 +1557,16 @@ local function DoMerchant()
 end
 S.DoMerchant = DoMerchant
 
--- Luồng kiểm tra và mua Merchant từ xa song song trong nền
-task.spawn(function()
-    while Alive() and Latest() do
-        if C["Auto Merchant"] then
-            pcall(DoMerchant)
+local function StartMerchantThread()
+    task.spawn(function()
+        while Alive() and Latest() do
+            if C["Auto Merchant"] then
+                pcall(DoMerchant)
+            end
+            task.wait(15)
         end
-        task.wait(15)
-    end
-end)
+    end)
+end
 
 -- ------------------------------------------------------------
 -- auto boosters (Space Mining Coins / Damage / Speed Booster)
@@ -1636,15 +1671,16 @@ local function DoBoosters()
 end
 S.DoBoosters = DoBoosters
 
--- Luồng kiểm tra và tự dùng Booster song song trong nền (không phụ thuộc vào chu kỳ quét quặng hay mine reset)
-task.spawn(function()
-    while Alive() and Latest() do
-        if C["Auto Booster"] then
-            pcall(DoBoosters)
+local function StartBoosterThread()
+    task.spawn(function()
+        while Alive() and Latest() do
+            if C["Auto Booster"] then
+                pcall(DoBoosters)
+            end
+            task.wait(5)
         end
-        task.wait(5)
-    end
-end)
+    end)
+end
 
 -- ------------------------------------------------------------
 -- Free Rewards (port từ main_mining2, VERIFIED 22/09): Save.FreeGiftsTime = giây đã chơi, Save.FreeGiftsRedeemed = {id...};
@@ -1981,16 +2017,39 @@ local function ZoneLayer()
 end
 
 local currentFps = 60
-local fpsConn = RunService.Heartbeat:Connect(function(dt)
-    if dt and dt > 0 then
-        currentFps = currentFps * 0.85 + (1 / dt) * 0.15
-    end
-end)
+local fpsConn = nil
+
+local function StartFpsCounter()
+    if fpsConn then pcall(function() fpsConn:Disconnect() end) end
+    fpsConn = RunService.Heartbeat:Connect(function(dt)
+        if dt and dt > 0 then
+            currentFps = currentFps * 0.85 + (1 / dt) * 0.15
+        end
+    end)
+end
 
 -- ---- dashboard (theo mẫu ui.lua) ----
 local gui, uiHidden = nil, false
 local UI = {}
-if C["Show UI"] then
+
+local function UpdateUI()
+    if not gui or not UI.time then return end
+    local el = math.max(1, os.clock() - S.stats.t0)
+    local z, y = ZoneLayer()
+    local curFps = math.clamp(math.round(currentFps), 1, 999)
+    local fpsColor = curFps >= 45 and "#50dc78" or (curFps >= 25 and "#ffaa00" or "#ff4444")
+    UI.time.Text   = ("Session Time: %s  •  FPS: <font color=\"%s\">%d</font>"):format(FmtTime(el), fpsColor, curFps)
+    UI.coins.Text  = "Space Coins: " .. FmtNum(SpaceCoins())
+    UI.ore.Text    = ("Ore: %d (%.0f/min)  |  Chest: %d  |  Fail %d"):format(S.stats.ore, S.stats.ore / el * 60, S.stats.chests or 0, S.stats.fail)
+    if UI.gems1 then UI.gems1.Text = GemLine("    ", GEMS_1, GEM_SHORT_1) end
+    if UI.gems2 then UI.gems2.Text = GemLine("    ", GEMS_2, GEM_SHORT_2) end
+    UI.zone.Text   = ("Zone %d  y=%d"):format(z, y)
+    UI.status.Text = "Status: " .. tostring(S.status)
+end
+
+local function InitUI()
+    if not C["Show UI"] then return end
+    StartFpsCounter()
     pcall(function()
         local old = lp.PlayerGui:FindFirstChild("OreSweepUI")
         if old then old:Destroy() end
@@ -2058,27 +2117,14 @@ if C["Show UI"] then
             if black then pcall(function() RunService:Set3dRenderingEnabled(uiHidden) end) end
         end)
     end)
+
+    task.spawn(function()
+        while Alive() do
+            pcall(UpdateUI)
+            task.wait(0.5)
+        end
+    end)
 end
-local function UpdateUI()
-    if not gui or not UI.time then return end
-    local el = math.max(1, os.clock() - S.stats.t0)
-    local z, y = ZoneLayer()
-    local curFps = math.clamp(math.round(currentFps), 1, 999)
-    local fpsColor = curFps >= 45 and "#50dc78" or (curFps >= 25 and "#ffaa00" or "#ff4444")
-    UI.time.Text   = ("Session Time: %s  •  FPS: <font color=\"%s\">%d</font>"):format(FmtTime(el), fpsColor, curFps)
-    UI.coins.Text  = "Space Coins: " .. FmtNum(SpaceCoins())
-    UI.ore.Text    = ("Ore: %d (%.0f/min)  |  Chest: %d  |  Fail %d"):format(S.stats.ore, S.stats.ore / el * 60, S.stats.chests or 0, S.stats.fail)
-    if UI.gems1 then UI.gems1.Text = GemLine("    ", GEMS_1, GEM_SHORT_1) end
-    if UI.gems2 then UI.gems2.Text = GemLine("    ", GEMS_2, GEM_SHORT_2) end
-    UI.zone.Text   = ("Zone %d  y=%d"):format(z, y)
-    UI.status.Text = "Status: " .. tostring(S.status)
-end
-task.spawn(function()
-    while Alive() do
-        pcall(UpdateUI)
-        task.wait(0.5)
-    end
-end)
 
 -- ---- Discord webhook ----
 local httpRequest = (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
@@ -2136,26 +2182,31 @@ local function CheckNewPets()
         petInit = true
     end)
 end
-CheckNewPets()
-task.spawn(function()
+local function StartWebhookThread()
+    CheckNewPets()
     if not C["Webhook URL"] or C["Webhook URL"] == "" then return end
-    task.wait(5)
-    StatusWebhook(lp.Name .. " – start", 0x2ecc71)
-    local last = os.clock()
-    while Alive() do
+    task.spawn(function()
         task.wait(5)
-        CheckNewPets()
-        if os.clock() - last > (tonumber(C["Webhook Every"]) or 600) then
-            last = os.clock()
-            StatusWebhook()
+        StatusWebhook(lp.Name .. " – start", 0x2ecc71)
+        local last = os.clock()
+        while Alive() do
+            task.wait(5)
+            CheckNewPets()
+            if os.clock() - last > (tonumber(C["Webhook Every"]) or 600) then
+                last = os.clock()
+                StatusWebhook()
+            end
         end
-    end
-end)
+    end)
+end
+
 -- ============================================================
 -- 🛡️ ADVANCED ANTI-AFK & REAL PLAYER BYPASS (PS99 + Roblox)
 -- ============================================================
 local afkConn, afkPeriodicThread
-if C["Anti AFK"] then
+local function StartAntiAFK()
+    if not C["Anti AFK"] then return end
+
     -- 1. Real Player Check Bypass (mở khóa Retention Gifts, Hidden Presents, prompts)
     pcall(function()
         local RealPlayerCmds = require(RS:WaitForChild("Library"):WaitForChild("Client"):WaitForChild("RealPlayerCmds"))
@@ -2235,9 +2286,15 @@ if C["Anti AFK"] then
         end)
     end)
 end
-local keyConn = UIS.InputBegan:Connect(function(input, gp)
-    if not gp and C["Stop Key"] and input.KeyCode == C["Stop Key"] then S.Stop("stop key") end
-end)
+
+local keyConn
+local function StartInputListener()
+    if keyConn then pcall(function() keyConn:Disconnect() end) end
+    keyConn = UIS.InputBegan:Connect(function(input, gp)
+        if not gp and C["Stop Key"] and input.KeyCode == C["Stop Key"] then S.Stop("stop key") end
+    end)
+end
+
 function S.Stop(reason)
     S.running = false
     HoldUnpatch()
@@ -2253,82 +2310,105 @@ end
 -- ------------------------------------------------------------
 -- main loop
 -- ------------------------------------------------------------
-log("Start. Zone %s | Ores %s | Auto Enchant %s | Combine %s | Idle Mine %s", tostring(C["Target Zone"]),
-    (function() local t = {} for k, v in pairs(C["Ores"]) do if v then t[#t + 1] = k end end table.sort(t) return table.concat(t, "/") end)(),
-    tostring(C["Auto Enchant"]), tostring(C["Auto Combine"]), tostring(C["Idle Mine"]))
-local lastReport = os.clock()
-task.spawn(function()
-    while Alive() do
-        local ok, err = pcall(function()
-            if not C["Enabled"] then S.status = "paused" task.wait(1) return end
-            if not EnsureInstance() then S.status = "ngoài event" task.wait(3) return end
+local function StartMainLoop()
+    log("Start. Zone %s | Ores %s | Auto Enchant %s | Combine %s | Idle Mine %s", tostring(C["Target Zone"]),
+        (function() local t = {} for k, v in pairs(C["Ores"]) do if v then t[#t + 1] = k end end table.sort(t) return table.concat(t, "/") end)(),
+        tostring(C["Auto Enchant"]), tostring(C["Auto Combine"]), tostring(C["Idle Mine"]))
+    local lastReport = os.clock()
+    task.spawn(function()
+        while Alive() do
+            local ok, err = pcall(function()
+                if not C["Enabled"] then S.status = "paused" task.wait(1) return end
+                if not EnsureInstance() then S.status = "ngoài event" task.wait(3) return end
 
-            -- Ưu tiên roll enchant: Nếu bật Auto Enchant và chưa đạt chỉ số -> ở lại Zone 7 roll cho xong rồi mới đi farm!
-            if DoEnchantPickaxe() then return end
+                -- Ưu tiên roll enchant: Nếu bật Auto Enchant và chưa đạt chỉ số -> ở lại Zone 7 roll cho xong rồi mới đi farm!
+                if DoEnchantPickaxe() then return end
 
-            local want = WantZone()
-            local loc = GetWorldForZone(want)
-            if loc ~= S.loc then S.locAt = os.clock() end -- vừa sang world mới -> RotateZone chờ block stream về rồi mới được kết luận "hết quặng"
-            S.loc = loc
-            if not loc then
-                S.status = "tele khu " .. want
-                TeleZoneTop(want) return
-            end
-            if ZoneOf(loc) ~= want then
-                log("Chuyển sang khu %d", want)
-                TeleZoneTop(want) return
-            end
-            if loc.Respawning then
-                S.status = "mine reset"
-                if S.rotZone then log("Mine reset ở khu %d -> về khu %d", ZoneOf(loc), BaseZone()) S.rotZone = nil end -- reset -> về khu gốc quét lại từ đầu
-                task.wait(1) return
-            end
-            -- ngoài vùng mine (bị đẩy) -> về mặt khu
-            local hrp = HRP()
-            local inside = true
-            if hrp then pcall(function() inside = loc:IsInsideXZ(hrp.Position) end) end
-            if not inside then TeleZoneTop(want) return end
+                local want = WantZone()
+                local loc = GetWorldForZone(want)
+                if loc ~= S.loc then S.locAt = os.clock() end -- vừa sang world mới -> RotateZone chờ block stream về rồi mới được kết luận "hết quặng"
+                S.loc = loc
+                if not loc then
+                    S.status = "tele khu " .. want
+                    TeleZoneTop(want) return
+                end
+                if ZoneOf(loc) ~= want then
+                    log("Chuyển sang khu %d", want)
+                    TeleZoneTop(want) return
+                end
+                if loc.Respawning then
+                    S.status = "mine reset"
+                    if S.rotZone then log("Mine reset ở khu %d -> về khu %d", ZoneOf(loc), BaseZone()) S.rotZone = nil end -- reset -> về khu gốc quét lại từ đầu
+                    task.wait(1) return
+                end
+                -- ngoài vùng mine (bị đẩy) -> về mặt khu
+                local hrp = HRP()
+                local inside = true
+                if hrp then pcall(function() inside = loc:IsInsideXZ(hrp.Position) end) end
+                if not inside then TeleZoneTop(want) return end
 
-            DoCombine()
-            DoBomb(loc)
-            DoMerchant()
-            DoBoosters()
-            DoFreeGifts()
+                DoCombine()
+                DoBomb(loc)
+                DoMerchant()
+                DoBoosters()
+                DoFreeGifts()
 
-            local fast, slow, total, buried, young, pendingAt = CollectOres(loc)
-            if #fast > 0 or #slow > 0 or young > 0 then S.emptySince = nil end -- còn quặng -> reset đồng hồ "mine chết"
-            if #fast >= (C["Min Ores"] or 3) then
-                local t0 = os.clock()
-                local n, why = Sweep(loc, fast)
-                dbg("Lượt: %d quặng / %.0fs (%s)", n, os.clock() - t0, tostring(why))
-                if n == 0 and why == "done" then S.status = "chờ quặng đang skip" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end -- còn quặng nhưng đều đang skip -> nghỉ, không quay tít
-            elseif #slow > 0 and C["Slow Last"] then
-                local n, why = Sweep(loc, slow)
-                if n == 0 and why == "done" then S.status = "chờ quặng đang skip" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end
-            elseif C["Dig Buried"] and DigBuried(loc) then
-                return -- quặng đã lộ -> vòng sau sweep lấy
-            elseif young > 0 then
-                S.status = ("chờ %d quặng mới load"):format(young) task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) -- mine respawn từng block: quặng non sắp đào được, không xoay khu
-            elseif pendingAt and pendingAt - os.clock() < 15 then
-                S.status = ("chờ quặng skip %.0fs"):format(pendingAt - os.clock()) task.wait(math.clamp(pendingAt - os.clock() + 0.1, 0.2, 1)) -- quặng ghost/che sắp hết skip -> đợi, không đổi khu
-            elseif C["Zone Rotate"] and RotateZone(loc) then
-                return -- world đổi, vòng sau lấy loc mới
-            elseif HopIfDead(loc, total) then
-                return -- đang teleport sang server khác
-            elseif C["Idle Mine"] then
-                local mined = IdleMine(loc, 20)
-                if mined == 0 then S.status = "chờ quặng" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end
-            else
-                S.status = "chờ quặng"
-                task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) -- poll nhanh: server cạn thì quặng respawn lắt nhắt, ngủ 5 s là mất lượt
+                local fast, slow, total, buried, young, pendingAt = CollectOres(loc)
+                if #fast > 0 or #slow > 0 or young > 0 then S.emptySince = nil end -- còn quặng -> reset đồng hồ "mine chết"
+                if #fast >= (C["Min Ores"] or 3) then
+                    local t0 = os.clock()
+                    local n, why = Sweep(loc, fast)
+                    dbg("Lượt: %d quặng / %.0fs (%s)", n, os.clock() - t0, tostring(why))
+                    if n == 0 and why == "done" then S.status = "chờ quặng đang skip" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end -- còn quặng nhưng đều đang skip -> nghỉ, không quay tít
+                elseif #slow > 0 and C["Slow Last"] then
+                    local n, why = Sweep(loc, slow)
+                    if n == 0 and why == "done" then S.status = "chờ quặng đang skip" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end
+                elseif C["Dig Buried"] and DigBuried(loc) then
+                    return -- quặng đã lộ -> vòng sau sweep lấy
+                elseif young > 0 then
+                    S.status = ("chờ %d quặng mới load"):format(young) task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) -- mine respawn từng block: quặng non sắp đào được, không xoay khu
+                elseif pendingAt and pendingAt - os.clock() < 15 then
+                    S.status = ("chờ quặng skip %.0fs"):format(pendingAt - os.clock()) task.wait(math.clamp(pendingAt - os.clock() + 0.1, 0.2, 1)) -- quặng ghost/che sắp hết skip -> đợi, không đổi khu
+                elseif C["Zone Rotate"] and RotateZone(loc) then
+                    return -- world đổi, vòng sau lấy loc mới
+                elseif HopIfDead(loc, total) then
+                    return -- đang teleport sang server khác
+                elseif C["Idle Mine"] then
+                    local mined = IdleMine(loc, 20)
+                    if mined == 0 then S.status = "chờ quặng" task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) end
+                else
+                    S.status = "chờ quặng"
+                    task.wait(math.clamp(tonumber(C["Idle Poll"]) or 0.4, 0.05, 5)) -- poll nhanh: server cạn thì quặng respawn lắt nhắt, ngủ 5 s là mất lượt
+                end
+            end)
+            if not ok then log("Lỗi: %s", tostring(err)) task.wait(2) end
+            if os.clock() - lastReport > 120 then
+                lastReport = os.clock()
+                local el = os.clock() - S.stats.t0
+                log("=== %.0f phút | ore %d (%.0f/phút) chest %d blocks %d bom %d fail %d chôn %d hop %d | combine %d | coins %s", el / 60, S.stats.ore, S.stats.ore / el * 60, S.stats.chests or 0, S.stats.blocks, S.stats.bombs or 0, S.stats.fail, S.stats.buried, S.stats.hops, S.stats.combines, FmtNum(SpaceCoins()))
             end
-        end)
-        if not ok then log("Lỗi: %s", tostring(err)) task.wait(2) end
-        if os.clock() - lastReport > 120 then
-            lastReport = os.clock()
-            local el = os.clock() - S.stats.t0
-            log("=== %.0f phút | ore %d (%.0f/phút) chest %d blocks %d bom %d fail %d chôn %d hop %d | combine %d | coins %s", el / 60, S.stats.ore, S.stats.ore / el * 60, S.stats.chests or 0, S.stats.blocks, S.stats.bombs or 0, S.stats.fail, S.stats.buried, S.stats.hops, S.stats.combines, FmtNum(SpaceCoins()))
+            task.wait()
         end
-        task.wait()
+    end)
+end
+
+-- ============================================================
+-- KHỞI CHẠY (CHỜ VÀO EVENT TRƯỚC RỒI MỚI CHẠY CÁC HỆ THỐNG PHỤ - TRÁNH CRASH MOBILE)
+-- ============================================================
+task.spawn(function()
+    log("Đang kiểm tra trạng thái event Space Mining...")
+    if not EnsureInstance() then
+        log("Không thể vào event Space Mining (hoặc Auto Join bị tắt). Vui lòng vào event trước!")
+        return
     end
+
+    log("Đã vào event an toàn -> Bắt đầu khởi động các hệ thống phụ...")
+    StartAntiAFK()
+    InitUI()
+    StartBombThread()
+    StartMerchantThread()
+    StartBoosterThread()
+    StartWebhookThread()
+    StartInputListener()
+    StartMainLoop()
 end)
